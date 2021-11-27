@@ -1,6 +1,6 @@
 use crate::{mstream::InnerMStream, EndPointId};
 use std::{io, mem, sync::Arc};
-use stream_channel::StreamChannel;
+use stream_channel::async_sc::StreamChannel;
 
 pub(crate) enum EndPointStatus {
     Unconnected(StreamChannel),

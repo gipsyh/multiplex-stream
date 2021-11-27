@@ -3,18 +3,18 @@ use crate::{
     EndPointId, MStreamEndPoint,
 };
 use async_bincode::{AsyncBincodeStream, AsyncDestination};
+use futures::StreamExt;
 use futures::{
     prelude::sink::SinkExt,
     stream::{SplitSink, SplitStream},
 };
-use futures::{StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use stream_channel::StreamChannel;
+use stream_channel::async_sc::StreamChannel;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     join, spawn,
@@ -96,11 +96,9 @@ async fn transfer_write(
     request_sender: RequestSender,
 ) -> io::Result<()> {
     loop {
-        let mut buf = vec![0_u8; 4096];
-        let res = stream.read(buf.as_mut_slice()).await?;
-        dbg!(res);
-        buf.truncate(res);
-        let data = buf.into_boxed_slice();
+        println!("reading from inner stream");
+        let data = stream.read_slice().await.unwrap();
+        println!("readed from inner stream");
         let request = Request {
             requestid: RequestId::new(),
             self_id: inner.self_id(),
@@ -110,10 +108,13 @@ async fn transfer_write(
         request_sender
             .send((request, send, inner.clone()))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))
+            .unwrap();
         if !recv
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .unwrap()
+            .unwrap()
         {
             return Err(io::Error::new(io::ErrorKind::Other, "transfer data failed"));
         }
@@ -130,14 +131,18 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
     request_sender: RequestSender,
 ) -> io::Result<()> {
     loop {
-        println!("begin handle message");
+        println!("recieving message");
         let message = stream_read
             .next()
             .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "stream closed"))?
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "stream closed"))
+            .unwrap()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .unwrap();
+        println!("recieved message");
         match message {
             Message::Request(request) => {
+                println!("recieved a request");
                 let response = match request.kind {
                     RequestKind::Connect(target) => match accept_waits.lock().await.remove(&target)
                     {
@@ -148,7 +153,8 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                             spawn(transfer_write(channel, inner, request_sender.clone()));
                             sender
                                 .send(Ok(()))
-                                .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))?;
+                                .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))
+                                .unwrap();
                             request.response(true)
                         }
                         None => request.response(false),
@@ -161,9 +167,11 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                     .await
                     .send(Message::Response(response))
                     .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                    .unwrap();
             }
             Message::Response(response) => {
+                println!("recieved an response");
                 let (target, sender, mut inner) = response_waits
                     .lock()
                     .await
@@ -181,6 +189,7 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                 sender.send(Ok(response.status)).unwrap();
             }
         }
+        println!("processd a message");
     }
 }
 
@@ -192,8 +201,13 @@ async fn handle_request<SW: AsyncWriteExt + Unpin>(
     response_waits: &Mutex<RequestWaitsMap>,
 ) -> io::Result<()> {
     loop {
-        let (request, response, inner) =
-            request_receiver.recv().await.ok_or(io::ErrorKind::Other)?;
+        println!("receving an inner request");
+        let (request, response, inner) = request_receiver
+            .recv()
+            .await
+            .ok_or(io::ErrorKind::Other)
+            .unwrap();
+        println!("receved an inner request");
         let target = if let RequestKind::Connect(target) = request.kind {
             target
         } else {
@@ -204,13 +218,15 @@ async fn handle_request<SW: AsyncWriteExt + Unpin>(
             .await
             .insert(request.requestid, (target, response, inner))
             .is_none());
-        println!("prepare send request to stream");
+        println!("prepare to send request");
         stream_write
             .lock()
             .await
             .send(Message::Request(request))
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .unwrap();
+        println!("sended a request");
     }
 }
 
@@ -219,7 +235,11 @@ async fn handle_accept(
     accept_waits: &Mutex<AcceptWaitsMap>,
 ) -> io::Result<()> {
     loop {
-        let (response, innerep) = accpet_receiver.recv().await.ok_or(io::ErrorKind::Other)?;
+        let (response, innerep) = accpet_receiver
+            .recv()
+            .await
+            .ok_or(io::ErrorKind::Other)
+            .unwrap();
         assert!(accept_waits
             .lock()
             .await
@@ -282,10 +302,13 @@ impl InnerMStream {
         self.request_sender
             .send((request, send, self_inner.clone()))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))
+            .unwrap();
         if recv
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .unwrap()
+            .unwrap()
         {
             Ok(())
         } else {
@@ -298,9 +321,11 @@ impl InnerMStream {
         self.accept_sender
             .send((send, self_inner.clone()))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))
+            .unwrap();
         recv.await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .unwrap()
     }
 }
 

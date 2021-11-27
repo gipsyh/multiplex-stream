@@ -1,10 +1,6 @@
 use crate::{inner_ep::InnerEndPoint, EndPointId};
-use std::{
-    io::{Read, Write},
-    pin::Pin,
-    sync::Arc,
-};
-use stream_channel::StreamChannel;
+use std::{pin::Pin, sync::Arc};
+use stream_channel::async_sc::StreamChannel;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 
 pub struct MStreamEndPoint {
@@ -36,11 +32,13 @@ impl MStreamEndPoint {
     pub fn target_id(&self) -> Option<EndPointId> {
         self.inner.target_id()
     }
-}
 
-impl Read for MStreamEndPoint {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.channel.read(buf)
+    pub async fn read_slice(&mut self) -> io::Result<Box<[u8]>> {
+        self.channel.read_slice().await
+    }
+
+    pub async fn write_slice(&mut self, data: Box<[u8]>) -> io::Result<()> {
+        self.channel.write_slice(data).await
     }
 }
 
@@ -54,36 +52,26 @@ impl AsyncRead for MStreamEndPoint {
     }
 }
 
-impl Write for MStreamEndPoint {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.channel.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.channel.flush()
-    }
-}
-
 impl AsyncWrite for MStreamEndPoint {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _buf: &[u8],
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        todo!()
+        Pin::new(&mut self.get_mut().channel).poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        todo!()
+        Pin::new(&mut self.get_mut().channel).poll_flush(cx)
     }
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        todo!()
+        Pin::new(&mut self.get_mut().channel).poll_shutdown(cx)
     }
 }
