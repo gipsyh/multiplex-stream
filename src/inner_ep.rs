@@ -69,27 +69,7 @@ impl InnerEndPoint {
         matches!(self.status, EndPointStatus::Unconnected(_))
     }
 }
+
 unsafe impl Sync for InnerEndPoint {}
+
 unsafe impl Send for InnerEndPoint {}
-
-// pub(crate) struct InnerEndPointRead {
-//     pub innerep: Arc<InnerEndPoint>,
-//     pub read: StreamChannelRead,
-// }
-
-// impl InnerEndPointRead {
-//     pub fn new(read: StreamChannelRead, innerep: Arc<InnerEndPoint>) -> Self {
-//         Self { innerep, read }
-//     }
-// }
-
-// pub(crate) struct InnerEndPointWrite {
-//     pub innerep: Arc<InnerEndPoint>,
-//     pub write: StreamChannelWrite,
-// }
-
-// impl InnerEndPointWrite {
-//     pub fn new(write: StreamChannelWrite, innerep: Arc<InnerEndPoint>) -> Self {
-//         Self { innerep, write }
-//     }
-// }

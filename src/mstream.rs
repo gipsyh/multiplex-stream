@@ -3,8 +3,11 @@ use crate::{
     EndPointId, MStreamEndPoint,
 };
 use async_bincode::{AsyncBincodeStream, AsyncDestination};
-use futures::prelude::sink::SinkExt;
-use futures::StreamExt;
+use futures::{
+    prelude::sink::SinkExt,
+    stream::{SplitSink, SplitStream},
+};
+use futures::{StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,11 +17,18 @@ use std::{
 use stream_channel::StreamChannel;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
+    join, spawn,
     sync::{mpsc, oneshot, Mutex},
 };
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 struct RequestId(usize);
+
+impl RequestId {
+    fn new() -> Self {
+        Self(rand::thread_rng().gen())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 enum RequestKind {
@@ -55,169 +65,196 @@ enum Message {
     Response(Response),
 }
 
-async fn handle_messgae<S: AsyncReadExt + AsyncWriteExt + Unpin>(
-    message: Message,
-    stream: &mut AsyncBincodeStream<S, Message, Message, AsyncDestination>,
-    response_waits: &mut HashMap<
-        RequestId,
-        (
-            EndPointId,
-            oneshot::Sender<io::Result<bool>>,
-            Arc<InnerEndPoint>,
-        ),
-    >,
-    accept_waits: &mut HashMap<EndPointId, (oneshot::Sender<io::Result<()>>, Arc<InnerEndPoint>)>,
-) -> io::Result<()> {
-    match message {
-        Message::Request(request) => {
-            let response = match request.kind {
-                RequestKind::Connect(target) => match accept_waits.remove(&target) {
-                    Some((sender, mut inner)) => {
-                        assert!(matches!(inner.status, EndPointStatus::Unconnected(_)));
-                        let inner_ptr = unsafe { Arc::get_mut_unchecked(&mut inner) };
-                        let channel = inner_ptr.set_connect(target);
-                        sender
-                            .send(Ok(()))
-                            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))?;
-                        request.response(true)
-                    }
-                    None => request.response(false),
-                },
-                RequestKind::Disconnect => todo!(),
-                RequestKind::Data(_) => todo!(),
-            };
-            stream
-                .send(Message::Response(response))
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        }
-        Message::Response(response) => {
-            let (target, sender, mut inner) = response_waits.remove(&response.requestid).unwrap();
-            if inner.is_unconnected() {
-                let inner_ptr = unsafe { Arc::get_mut_unchecked(&mut inner) };
-                let channel = inner_ptr.set_connect(target);
-            }
-            sender.send(Ok(response.status)).unwrap();
-        }
-    }
-    Ok(())
-}
+type RequestSender = mpsc::Sender<(
+    Request,
+    oneshot::Sender<io::Result<bool>>,
+    Arc<InnerEndPoint>,
+)>;
 
-async fn dispatch_message<S: AsyncReadExt + AsyncWriteExt + Unpin>(
-    stream: S,
-    mut request_receiver: mpsc::Receiver<(
-        Request,
+type RequestReceiver = mpsc::Receiver<(
+    Request,
+    oneshot::Sender<io::Result<bool>>,
+    Arc<InnerEndPoint>,
+)>;
+
+type RequestWaitsMap = HashMap<
+    RequestId,
+    (
+        EndPointId,
         oneshot::Sender<io::Result<bool>>,
         Arc<InnerEndPoint>,
-    )>,
-    mut accpet_receiver: mpsc::Receiver<(oneshot::Sender<io::Result<()>>, Arc<InnerEndPoint>)>,
+    ),
+>;
+
+type AcceptWaitsMap = HashMap<EndPointId, (oneshot::Sender<io::Result<()>>, Arc<InnerEndPoint>)>;
+
+type AcceptReceiver = mpsc::Receiver<(oneshot::Sender<io::Result<()>>, Arc<InnerEndPoint>)>;
+
+async fn transfer_write(
+    mut stream: StreamChannel,
+    inner: Arc<InnerEndPoint>,
+    request_sender: RequestSender,
 ) -> io::Result<()> {
-    let mut response_waits = HashMap::new();
-    let mut accept_waits = HashMap::new();
-    let mut stream = AsyncBincodeStream::<_, Message, Message, _>::from(stream).for_async();
     loop {
-        tokio::select! {
-            res = stream.next() => {
-                let message = res.unwrap().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                handle_messgae(message, &mut stream, &mut response_waits, &mut accept_waits).await.unwrap();
-            },
-            res = request_receiver.recv() => {
-                let (request, response, inner) = res.ok_or(io::ErrorKind::Other)?;
-                let target = if let RequestKind::Connect(target) = request.kind {
-                    target
-                } else {
-                    inner.target_id().unwrap()
+        let mut buf = vec![0_u8; 4096];
+        let res = stream.read(buf.as_mut_slice()).await?;
+        dbg!(res);
+        buf.truncate(res);
+        let data = buf.into_boxed_slice();
+        let request = Request {
+            requestid: RequestId::new(),
+            self_id: inner.self_id(),
+            kind: RequestKind::Data(data),
+        };
+        let (send, recv) = oneshot::channel();
+        request_sender
+            .send((request, send, inner.clone()))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))?;
+        if !recv
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
+        {
+            return Err(io::Error::new(io::ErrorKind::Other, "transfer data failed"));
+        }
+    }
+}
+
+async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
+    mut stream_read: SplitStream<AsyncBincodeStream<SR, Message, Message, AsyncDestination>>,
+    stream_write: &Mutex<
+        SplitSink<AsyncBincodeStream<SW, Message, Message, AsyncDestination>, Message>,
+    >,
+    response_waits: &Mutex<RequestWaitsMap>,
+    accept_waits: &Mutex<AcceptWaitsMap>,
+    request_sender: RequestSender,
+) -> io::Result<()> {
+    loop {
+        println!("begin handle message");
+        let message = stream_read
+            .next()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "stream closed"))?
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        match message {
+            Message::Request(request) => {
+                let response = match request.kind {
+                    RequestKind::Connect(target) => match accept_waits.lock().await.remove(&target)
+                    {
+                        Some((sender, mut inner)) => {
+                            assert!(matches!(inner.status, EndPointStatus::Unconnected(_)));
+                            let inner_ptr = unsafe { Arc::get_mut_unchecked(&mut inner) };
+                            let channel = inner_ptr.set_connect(target);
+                            spawn(transfer_write(channel, inner, request_sender.clone()));
+                            sender
+                                .send(Ok(()))
+                                .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))?;
+                            request.response(true)
+                        }
+                        None => request.response(false),
+                    },
+                    RequestKind::Disconnect => todo!(),
+                    RequestKind::Data(_) => todo!(),
                 };
-                assert!(response_waits
-                    .insert(request.requestid, (target, response, inner))
-                    .is_none());
-                stream
-                    .send(Message::Request(request))
+                stream_write
+                    .lock()
+                    .await
+                    .send(Message::Response(response))
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            },
-            res = accpet_receiver.recv() => {
-                let (response, innerep) = res.ok_or(io::ErrorKind::Other)?;
-                assert!(accept_waits
-                    .insert(innerep.self_id(), (response, innerep))
-                    .is_none());
+            }
+            Message::Response(response) => {
+                let (target, sender, mut inner) = response_waits
+                    .lock()
+                    .await
+                    .remove(&response.requestid)
+                    .unwrap();
+                if inner.is_unconnected() {
+                    let inner_ptr = unsafe { Arc::get_mut_unchecked(&mut inner) };
+                    let channel = inner_ptr.set_connect(target);
+                    spawn(transfer_write(
+                        channel,
+                        inner.clone(),
+                        request_sender.clone(),
+                    ));
+                }
+                sender.send(Ok(response.status)).unwrap();
             }
         }
-        // {
-        //     let (request, response, inner) =
-        //         request_receiver.recv().await.ok_or(io::ErrorKind::Other)?;
-        //     let target = if let RequestKind::Connect(target) = request.kind {
-        //         target
-        //     } else {
-        //         inner.target_id().unwrap()
-        //     };
-        //     assert!(response_waits
-        //         .insert(request.requestid, (target, response, inner))
-        //         .is_none());
-        //     stream
-        //         .send(Message::Request(request))
-        //         .await
-        //         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        // }
-        // {
-        //     let (response, innerep) = accpet_receiver.recv().await.ok_or(io::ErrorKind::Other)?;
-        //     assert!(accept_waits
-        //         .insert(innerep.self_id(), (response, innerep))
-        //         .is_none());
-        // }
-        //             let mut endpoints = endpoints.lock().await;
-        //             let endpoint = endpoints.get_mut(&header.target).unwrap();
-        //             endpoint.write.write_data_in_vec(data).unwrap();
     }
 }
 
-// handle: JoinHandle<impl Future<Output = Result<(), Error>>>,
+async fn handle_request<SW: AsyncWriteExt + Unpin>(
+    stream_write: &Mutex<
+        SplitSink<AsyncBincodeStream<SW, Message, Message, AsyncDestination>, Message>,
+    >,
+    mut request_receiver: RequestReceiver,
+    response_waits: &Mutex<RequestWaitsMap>,
+) -> io::Result<()> {
+    loop {
+        let (request, response, inner) =
+            request_receiver.recv().await.ok_or(io::ErrorKind::Other)?;
+        let target = if let RequestKind::Connect(target) = request.kind {
+            target
+        } else {
+            inner.target_id().unwrap()
+        };
+        assert!(response_waits
+            .lock()
+            .await
+            .insert(request.requestid, (target, response, inner))
+            .is_none());
+        println!("prepare send request to stream");
+        stream_write
+            .lock()
+            .await
+            .send(Message::Request(request))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    }
+}
 
-// async fn transfer_write(
-//     mut endpoint: InnerEndPointRead,
-// ) -> io::Result<(Vec<u8>, InnerEndPointRead)> {
-//     let mut buf = vec![0_u8; 4096];
-//     let res = endpoint.read.read(buf.as_mut_slice()).await?;
-//     dbg!(res);
-//     buf.truncate(res);
-//     let header = MStreamRequest {
-//         endpid: endpoint.innerep.target_id(),
-//         length: res,
-//     };
-//     let mut ans = bincode::serialize(&header).unwrap();
-//     ans.extend(buf);
-//     Ok((ans, endpoint))
-// }
-
-// async fn undispatch_write<S: AsyncWriteExt + Unpin + Send + 'static>(
-//     mut stream: S,
-//     endpoints: Vec<InnerEndPointRead>,
-// ) -> io::Result<()> {
-//     let mut ans = Vec::new();
-//     for endpoint in endpoints {
-//         ans.push(spawn(transfer_write(endpoint)));
-//     }
-//     loop {
-//         let ret;
-//         let _tmp;
-//         (ret, _tmp, ans) = futures::future::select_all(ans).await;
-//         let (data, endpoint) = ret.unwrap().unwrap();
-//         stream.write_all(data.as_slice()).await?;
-//         ans.push(spawn(transfer_write(endpoint)));
-//     }
-// }
+async fn handle_accept(
+    mut accpet_receiver: AcceptReceiver,
+    accept_waits: &Mutex<AcceptWaitsMap>,
+) -> io::Result<()> {
+    loop {
+        let (response, innerep) = accpet_receiver.recv().await.ok_or(io::ErrorKind::Other)?;
+        assert!(accept_waits
+            .lock()
+            .await
+            .insert(innerep.self_id(), (response, innerep))
+            .is_none());
+    }
+}
 
 #[tokio::main]
-async fn mstream_main<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static>(
+async fn mstream_main<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: S,
-    request_receiver: mpsc::Receiver<(
-        Request,
-        oneshot::Sender<io::Result<bool>>,
-        Arc<InnerEndPoint>,
-    )>,
+    request_receiver: RequestReceiver,
+    request_sender: RequestSender,
     accpet_receiver: mpsc::Receiver<(oneshot::Sender<io::Result<()>>, Arc<InnerEndPoint>)>,
 ) -> io::Result<()> {
-    tokio::join!(dispatch_message(stream, request_receiver, accpet_receiver)).0
+    let response_waits = Mutex::new(HashMap::new());
+    let accept_waits = Mutex::new(HashMap::new());
+    let stream = AsyncBincodeStream::<_, Message, Message, _>::from(stream).for_async();
+    let (stream_write, stream_read) = stream.split();
+    let stream_write = Mutex::new(stream_write);
+    let handle_messgae = handle_messgae(
+        stream_read,
+        &stream_write,
+        &response_waits,
+        &accept_waits,
+        request_sender,
+    );
+    let handle_request = handle_request(&stream_write, request_receiver, &response_waits);
+    let handle_accept = handle_accept(accpet_receiver, &accept_waits);
+    let (handle_messgae, handle_request, handle_accept) =
+        join!(handle_messgae, handle_request, handle_accept);
+    handle_messgae.unwrap();
+    handle_request.unwrap();
+    handle_accept.unwrap();
+    todo!();
 }
 
 pub(crate) struct InnerMStream {
@@ -237,7 +274,7 @@ impl InnerMStream {
         target: EndPointId,
     ) -> io::Result<()> {
         let request = Request {
-            requestid: RequestId(rand::thread_rng().gen()),
+            requestid: RequestId::new(),
             kind: RequestKind::Connect(target),
             self_id: self_inner.self_id(),
         };
@@ -276,8 +313,15 @@ impl MStream {
     pub fn new<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static>(stream: S) -> Self {
         let (request_sender, request_receiver) = mpsc::channel(1024);
         let (accept_sender, accpet_receiver) = mpsc::channel(1024);
-        let _handle =
-            std::thread::spawn(|| mstream_main(stream, request_receiver, accpet_receiver));
+        let request_sender_clone = request_sender.clone();
+        let _handle = std::thread::spawn(|| {
+            mstream_main(
+                stream,
+                request_receiver,
+                request_sender_clone,
+                accpet_receiver,
+            )
+        });
         Self {
             // handle,
             inner: Arc::new(InnerMStream {
