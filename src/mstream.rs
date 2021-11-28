@@ -21,7 +21,7 @@ use tokio::{
     sync::{mpsc, oneshot, Mutex},
 };
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct RequestId(usize);
 
 impl RequestId {
@@ -30,14 +30,14 @@ impl RequestId {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 enum RequestKind {
     Connect(EndPointId),
     Disconnect,
     Data(Box<[u8]>),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Request {
     requestid: RequestId,
     self_id: EndPointId,
@@ -53,13 +53,13 @@ impl Request {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Response {
     requestid: RequestId,
     status: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 enum Message {
     Request(Request),
     Response(Response),
@@ -98,7 +98,7 @@ async fn transfer_write(
     loop {
         println!("reading from inner stream");
         let data = stream.read_slice().await.unwrap();
-        println!("readed from inner stream");
+        println!("readed from inner stream:{}", data.len());
         let request = Request {
             requestid: RequestId::new(),
             self_id: inner.self_id(),
@@ -139,7 +139,7 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
             .unwrap()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
             .unwrap();
-        println!("recieved message");
+        println!("recieved message: {:?}", message);
         match message {
             Message::Request(request) => {
                 println!("recieved a request");
@@ -218,14 +218,16 @@ async fn handle_request<SW: AsyncWriteExt + Unpin>(
             .await
             .insert(request.requestid, (target, response, inner))
             .is_none());
-        println!("prepare to send request");
+        let message = Message::Request(request);
+        println!("prepare to send request: {:?}", message);
         stream_write
             .lock()
             .await
-            .send(Message::Request(request))
+            .send(message)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
             .unwrap();
+        stream_write.lock().await.flush().await.unwrap();
         println!("sended a request");
     }
 }
@@ -235,11 +237,13 @@ async fn handle_accept(
     accept_waits: &Mutex<AcceptWaitsMap>,
 ) -> io::Result<()> {
     loop {
+        println!("reciving accept");
         let (response, innerep) = accpet_receiver
             .recv()
             .await
             .ok_or(io::ErrorKind::Other)
             .unwrap();
+        println!("recived accept");
         assert!(accept_waits
             .lock()
             .await
@@ -274,7 +278,7 @@ async fn mstream_main<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     handle_messgae.unwrap();
     handle_request.unwrap();
     handle_accept.unwrap();
-    todo!();
+    panic!();
 }
 
 pub(crate) struct InnerMStream {
