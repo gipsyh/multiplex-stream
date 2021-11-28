@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use stream_channel::async_sc::StreamChannel;
+use stream_channel::async_sc::{StreamChannel, StreamChannelRead};
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     join, spawn,
@@ -91,7 +91,7 @@ type AcceptWaitsMap = HashMap<EndPointId, (oneshot::Sender<io::Result<()>>, Arc<
 type AcceptReceiver = mpsc::Receiver<(oneshot::Sender<io::Result<()>>, Arc<InnerEndPoint>)>;
 
 async fn transfer_write(
-    mut stream: StreamChannel,
+    mut stream: StreamChannelRead,
     inner: Arc<InnerEndPoint>,
     request_sender: RequestSender,
 ) -> io::Result<()> {
@@ -130,6 +130,7 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
     accept_waits: &Mutex<AcceptWaitsMap>,
     request_sender: RequestSender,
 ) -> io::Result<()> {
+    let mut connected_points = HashMap::new();
     loop {
         println!("recieving message");
         let message = stream_read
@@ -149,8 +150,13 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                         Some((sender, mut inner)) => {
                             assert!(matches!(inner.status, EndPointStatus::Unconnected(_)));
                             let inner_ptr = unsafe { Arc::get_mut_unchecked(&mut inner) };
-                            let channel = inner_ptr.set_connect(target);
-                            spawn(transfer_write(channel, inner, request_sender.clone()));
+                            let (channelr, channelw) = inner_ptr.set_connect(target).split();
+                            spawn(transfer_write(
+                                channelr,
+                                inner.clone(),
+                                request_sender.clone(),
+                            ));
+                            connected_points.insert(request.self_id, channelw);
                             sender
                                 .send(Ok(()))
                                 .map_err(|_| io::Error::new(io::ErrorKind::Other, ""))
@@ -160,7 +166,14 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                         None => request.response(false),
                     },
                     RequestKind::Disconnect => todo!(),
-                    RequestKind::Data(_) => todo!(),
+                    RequestKind::Data(data) => {
+                        let channel = connected_points.get_mut(&request.self_id).unwrap();
+                        channel.write_slice(data).await.unwrap();
+                        Response {
+                            requestid: request.requestid,
+                            status: true,
+                        }
+                    }
                 };
                 stream_write
                     .lock()
@@ -179,12 +192,13 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                     .unwrap();
                 if inner.is_unconnected() {
                     let inner_ptr = unsafe { Arc::get_mut_unchecked(&mut inner) };
-                    let channel = inner_ptr.set_connect(target);
+                    let (channelr, channelw) = inner_ptr.set_connect(target).split();
                     spawn(transfer_write(
-                        channel,
+                        channelr,
                         inner.clone(),
                         request_sender.clone(),
                     ));
+                    connected_points.insert(target, channelw);
                 }
                 sender.send(Ok(response.status)).unwrap();
             }

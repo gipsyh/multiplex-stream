@@ -9,5 +9,7 @@ async fn main() {
     let mut endp = mstream.new_endpoint(EndPointId(1)).await.unwrap();
     std::thread::sleep(Duration::from_secs(1));
     endp.connect(EndPointId(1)).await.unwrap();
+    let data = Vec::from(endp.read_slice().await.unwrap());
+    dbg!(data);
     loop {}
 }
