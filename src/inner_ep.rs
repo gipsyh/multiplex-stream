@@ -5,7 +5,7 @@ use stream_channel::async_sc::StreamChannel;
 pub(crate) enum EndPointStatus {
     Unconnected(StreamChannel),
     Connected(EndPointId),
-    Disconnected,
+    _Disconnected,
 }
 
 pub(crate) struct InnerEndPoint {

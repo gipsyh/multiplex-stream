@@ -3,10 +3,10 @@ use crate::{
     EndPointId, MStreamEndPoint,
 };
 use async_bincode::{AsyncBincodeStream, AsyncDestination};
-use futures::StreamExt;
 use futures::{
     prelude::sink::SinkExt,
     stream::{SplitSink, SplitStream},
+    StreamExt,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
