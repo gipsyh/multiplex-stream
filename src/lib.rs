@@ -1,4 +1,3 @@
-#![feature(destructuring_assignment)]
 #![feature(get_mut_unchecked)]
 
 mod inner_ep;

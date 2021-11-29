@@ -190,7 +190,7 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                     .await
                     .remove(&response.requestid)
                     .unwrap();
-                if inner.is_unconnected() {
+                if inner.is_unconnected() && response.status {
                     let inner_ptr = unsafe { Arc::get_mut_unchecked(&mut inner) };
                     let (channelr, channelw) = inner_ptr.set_connect(target).split();
                     spawn(transfer_write(
