@@ -96,9 +96,9 @@ async fn transfer_write(
     request_sender: RequestSender,
 ) -> io::Result<()> {
     loop {
-        println!("reading from inner stream");
+        // println!("reading from inner stream");
         let data = stream.read_slice().await.unwrap();
-        println!("readed from inner stream:{}", data.len());
+        // println!("readed from inner stream:{}", data.len());
         let request = Request {
             requestid: RequestId::new(),
             self_id: inner.self_id(),
@@ -132,7 +132,7 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
 ) -> io::Result<()> {
     let mut connected_points = HashMap::new();
     loop {
-        println!("recieving message");
+        // println!("recieving message");
         let message = stream_read
             .next()
             .await
@@ -140,10 +140,10 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
             .unwrap()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
             .unwrap();
-        println!("recieved message: {:?}", message);
+        // println!("recieved message: {:?}", message);
         match message {
             Message::Request(request) => {
-                println!("recieved a request");
+                // println!("recieved a request");
                 let response = match request.kind {
                     RequestKind::Connect(target) => match accept_waits.lock().await.remove(&target)
                     {
@@ -184,7 +184,7 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                     .unwrap();
             }
             Message::Response(response) => {
-                println!("recieved an response");
+                // println!("recieved an response");
                 let (target, sender, mut inner) = response_waits
                     .lock()
                     .await
@@ -203,7 +203,7 @@ async fn handle_messgae<SR: AsyncReadExt + Unpin, SW: AsyncWriteExt + Unpin>(
                 sender.send(Ok(response.status)).unwrap();
             }
         }
-        println!("processd a message");
+        // println!("processd a message");
     }
 }
 
@@ -215,13 +215,13 @@ async fn handle_request<SW: AsyncWriteExt + Unpin>(
     response_waits: &Mutex<RequestWaitsMap>,
 ) -> io::Result<()> {
     loop {
-        println!("receving an inner request");
+        // println!("receving an inner request");
         let (request, response, inner) = request_receiver
             .recv()
             .await
             .ok_or(io::ErrorKind::Other)
             .unwrap();
-        println!("receved an inner request");
+        // println!("receved an inner request");
         let target = if let RequestKind::Connect(target) = request.kind {
             target
         } else {
@@ -233,7 +233,7 @@ async fn handle_request<SW: AsyncWriteExt + Unpin>(
             .insert(request.requestid, (target, response, inner))
             .is_none());
         let message = Message::Request(request);
-        println!("prepare to send request: {:?}", message);
+        // println!("prepare to send request: {:?}", message);
         stream_write
             .lock()
             .await
@@ -242,7 +242,7 @@ async fn handle_request<SW: AsyncWriteExt + Unpin>(
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
             .unwrap();
         stream_write.lock().await.flush().await.unwrap();
-        println!("sended a request");
+        // println!("sended a request");
     }
 }
 
@@ -251,13 +251,13 @@ async fn handle_accept(
     accept_waits: &Mutex<AcceptWaitsMap>,
 ) -> io::Result<()> {
     loop {
-        println!("reciving accept");
+        // println!("reciving accept");
         let (response, innerep) = accpet_receiver
             .recv()
             .await
             .ok_or(io::ErrorKind::Other)
             .unwrap();
-        println!("recived accept");
+        // println!("recived accept");
         assert!(accept_waits
             .lock()
             .await
